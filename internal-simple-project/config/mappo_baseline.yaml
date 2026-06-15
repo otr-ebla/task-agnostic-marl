@@ -1,0 +1,46 @@
+env:
+  num_robots: 3
+  num_humans: 0          # no dynamic obstacles in this baseline
+  k_teammates: 2         # how many closest teammates each robot observes
+  m_humans: 1            # observation slots for humans (zero-padded when 0 humans)
+  n_rays: 36             # lidar rays, one every 10 degrees
+  max_lidar_range: 5.0   # metres
+  cell_size: 0.5         # metres per grid cell → 24×16 = 384 cells for 12×8 m map
+  sensing_radius: 5.0    # radius within which teammates / humans are visible
+  robot_radius: 0.20     # metres, used for collision and spawn clearance
+  dt: 0.1                # physics time step (seconds)
+  max_steps: 500         # steps before truncation
+  v_max: 1.0             # max linear velocity (m/s); action[:,0] remapped [-1,1]→[0,v_max]
+  omega_max: 1.0         # max angular velocity (rad/s)
+  # collision: soft (False) keeps episodes running so robots learn from longer trajectories
+  terminate_on_collision: false
+  # local coverage patch: gives actors a birds-eye view of nearby coverage without
+  # breaking decentralised execution — this is the key driver of efficient coverage
+  use_local_coverage_obs: true
+  local_coverage_size: 7    # 7×7 = 49 binary cells centred on the robot
+  # reward weights
+  alpha: 10.0            # new cells covered
+  beta: 0.1              # redundant cell visits
+  kappa: 20.0            # collision penalty
+  tau: 0.01              # per-step time penalty
+
+model:
+  hidden_size: 128       # MLP feature extractor width
+  gru_hidden: 128        # GRU hidden state size
+  critic_hidden: 256     # centralised critic MLP width
+
+train:
+  rollout_steps: 256     # T — longer rollouts give the GRU more context per update
+  total_updates: 3000    # 3000 × 256 = 768K environment steps
+  log_interval: 10       # print every N updates
+  save_interval: 100     # save checkpoint every N updates
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr_actor: 3.0e-4
+  lr_critic: 1.0e-3
+  lr_decay: true         # linear decay to 0 over training
+  clip_eps: 0.2
+  entropy_coef: 0.02     # slightly higher than 0.01 to encourage early exploration
+  max_grad_norm: 10.0
+  n_epochs: 10           # PPO epochs per update
+  normalize_obs: true    # RunningMeanStd normalisation for stable training
