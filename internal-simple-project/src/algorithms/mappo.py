@@ -8,16 +8,28 @@ from torch.distributions import Normal
 
 class RolloutBuffer:
     """
-    Fixed-length (T steps, N agents) experience buffer.
+    Fixed-length (T steps, E parallel envs, N agents) experience buffer.
 
-    All tensors live on the target device.  The buffer is filled one step
-    at a time via insert(), then compute_returns() closes the GAE computation
-    and resets the write pointer so the buffer can be reused.
+    All tensors live on the target device.  The buffer is filled one step at a
+    time via insert(), then compute_returns() closes the GAE computation and
+    resets the write pointer so the buffer can be reused.
+
+    Shapes
+    ------
+    obs       : (T, E, N, obs_dim)
+    states    : (T, E, state_dim)
+    actions   : (T, E, N, action_dim)
+    log_probs : (T, E, N)
+    rewards   : (T, E, N)
+    values    : (T+1, E)     — +1 row for the bootstrap value
+    dones     : (T, E)       — 1.0 when the episode terminates (hard collision)
+    hx        : (T, E, N, gru_hidden)
     """
 
     def __init__(
         self,
         T: int,
+        E: int,
         N: int,
         obs_dim: int,
         state_dim: int,
@@ -25,81 +37,80 @@ class RolloutBuffer:
         gru_hidden: int,
         device: torch.device,
     ):
-        self.T, self.N = T, N
-        self.device    = device
+        self.T, self.E, self.N = T, E, N
+        self.device = device
 
-        self.obs       = torch.zeros(T, N, obs_dim,     device=device)
-        self.states    = torch.zeros(T, state_dim,      device=device)
-        self.actions   = torch.zeros(T, N, action_dim,  device=device)
-        self.log_probs = torch.zeros(T, N,              device=device)
-        self.rewards   = torch.zeros(T, N,              device=device)
-        self.values    = torch.zeros(T + 1,             device=device)   # +1 for bootstrap
-        self.dones     = torch.zeros(T,                 device=device)
-        self.hx        = torch.zeros(T, N, gru_hidden,  device=device)
+        self.obs       = torch.zeros(T, E, N, obs_dim,    device=device)
+        self.states    = torch.zeros(T, E, state_dim,     device=device)
+        self.actions   = torch.zeros(T, E, N, action_dim, device=device)
+        self.log_probs = torch.zeros(T, E, N,             device=device)
+        self.rewards   = torch.zeros(T, E, N,             device=device)
+        self.values    = torch.zeros(T + 1, E,            device=device)   # +1 for bootstrap
+        self.dones     = torch.zeros(T, E,                device=device)
+        self.hx        = torch.zeros(T, E, N, gru_hidden, device=device)
         self.ptr       = 0
 
-        # Filled by compute_returns
         self.advantages: torch.Tensor | None = None
         self.returns:    torch.Tensor | None = None
 
     def insert(
         self,
-        obs:       torch.Tensor,   # (N, obs_dim)
-        state:     torch.Tensor,   # (state_dim,)
-        actions:   torch.Tensor,   # (N, action_dim)
-        log_probs: torch.Tensor,   # (N,)
-        rewards:   torch.Tensor,   # (N,)
-        value:     torch.Tensor,   # scalar
-        done:      bool,
-        hx:        torch.Tensor,   # (N, gru_hidden)
+        obs:       torch.Tensor,   # (E, N, obs_dim)
+        states:    torch.Tensor,   # (E, state_dim)
+        actions:   torch.Tensor,   # (E, N, action_dim)
+        log_probs: torch.Tensor,   # (E, N)
+        rewards:   torch.Tensor,   # (E, N)
+        values:    torch.Tensor,   # (E,)
+        dones:     torch.Tensor,   # (E,)
+        hx:        torch.Tensor,   # (E, N, gru_hidden)
     ) -> None:
         t = self.ptr
         self.obs[t]       = obs
-        self.states[t]    = state
+        self.states[t]    = states
         self.actions[t]   = actions
         self.log_probs[t] = log_probs
         self.rewards[t]   = rewards
-        self.values[t]    = value
-        self.dones[t]     = float(done)
+        self.values[t]    = values
+        self.dones[t]     = dones
         self.hx[t]        = hx
         self.ptr += 1
 
     def compute_returns(
         self,
-        last_value:  torch.Tensor,
+        last_values: torch.Tensor,   # (E,)
         gamma:       float,
         gae_lambda:  float,
     ) -> None:
         """
-        GAE-λ advantage and discounted return computation.
+        GAE-λ advantage and discounted return computation, independent per env.
 
-        last_value  — V(s_T), the bootstrap value after the final stored step.
-        dones       — 1 when the episode terminates (collision); 0 on truncation
-                      so we still bootstrap for time-limited episodes.
+        last_values — V(s_T) bootstrap value for each env after the last stored step.
+        dones       — 1 only on hard termination (collision); truncation bootstraps normally.
         """
-        self.values[self.ptr] = last_value.squeeze()
+        self.values[self.ptr] = last_values   # (E,)
 
-        advantages = torch.zeros(self.T, device=self.device)
-        gae = 0.0
+        advantages = torch.zeros(self.T, self.E, device=self.device)
+        gae        = torch.zeros(self.E,         device=self.device)
+
         for t in reversed(range(self.T)):
-            mask  = 1.0 - self.dones[t]
-            # Team reward = mean over agents (identical for shared reward)
-            team_r = self.rewards[t].mean()
+            mask   = 1.0 - self.dones[t]                            # (E,)
+            team_r = self.rewards[t].mean(dim=-1)                    # (E,) — mean over N agents
             delta  = team_r + gamma * self.values[t + 1] * mask - self.values[t]
             gae    = delta + gamma * gae_lambda * mask * gae
             advantages[t] = gae
 
-        self.returns    = advantages + self.values[: self.T]
-        self.advantages = advantages
-        self.ptr        = 0   # reset for next rollout
+        self.returns    = advantages + self.values[: self.T]   # (T, E)
+        self.advantages = advantages                            # (T, E)
+        self.ptr        = 0
 
 
 class MAPPO:
     """
     Multi-Agent PPO with a centralised critic and parameter-shared actor.
 
-    The actor is trained per-agent with agent-specific observations and a
-    shared advantage signal from the centralised critic.
+    Supports E parallel environments: all actor and critic forward passes are
+    batched across (E × N) agent-slots in a single call, so data collection is
+    as fast as a single vectorised network pass.
     """
 
     def __init__(
@@ -109,11 +120,11 @@ class MAPPO:
         config: dict,
         device: str = 'cpu',
     ):
-        self.actor   = actor.to(device)
-        self.critic  = critic.to(device)
-        self.device  = torch.device(device)
+        self.actor  = actor.to(device)
+        self.critic = critic.to(device)
+        self.device = torch.device(device)
 
-        self.actor_opt  = torch.optim.Adam(
+        self.actor_opt = torch.optim.Adam(
             actor.parameters(),  lr=config.get('lr_actor',  3e-4), eps=1e-5
         )
         self.critic_opt = torch.optim.Adam(
@@ -134,53 +145,63 @@ class MAPPO:
     @torch.no_grad()
     def get_actions(
         self,
-        obs_np:   np.ndarray,   # (N, obs_dim)
-        state_np: np.ndarray,   # (state_dim,)
-        hx:       torch.Tensor, # (N, gru_hidden)
+        obs_np:   np.ndarray,   # (E, N, obs_dim)
+        state_np: np.ndarray,   # (E, state_dim)
+        hx:       torch.Tensor, # (E, N, gru_hidden)  on device
     ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns
         -------
-        actions   : (N, action_dim)  numpy, squashed to (-1, 1)
-        log_probs : (N,)             tensor (CPU)
-        value     : scalar           tensor (CPU)
-        new_hx    : (N, gru_hidden)  tensor (device)
+        actions   : (E, N, action_dim)  numpy, squashed to (-1, 1)
+        log_probs : (E, N)              tensor (CPU)
+        values    : (E,)                tensor (CPU)
+        new_hx    : (E, N, gru_hidden)  tensor (device)
         """
-        obs   = torch.from_numpy(obs_np).float().to(self.device)
-        state = torch.from_numpy(state_np).float().unsqueeze(0).to(self.device)
+        E, N = obs_np.shape[:2]
 
-        mean, log_std, new_hx = self.actor(obs, hx)
+        obs   = torch.from_numpy(obs_np).float().to(self.device)    # (E, N, obs_dim)
+        state = torch.from_numpy(state_np).float().to(self.device)  # (E, state_dim)
+
+        # Flatten E×N into one batch for the shared actor
+        obs_f = obs.reshape(E * N, -1)
+        hx_f  = hx.reshape(E * N, -1)
+
+        mean, log_std, new_hx_f = self.actor(obs_f, hx_f)
         std  = log_std.exp().expand_as(mean)
         dist = Normal(mean, std)
-        z    = dist.sample()                              # unbounded Gaussian sample
-        a    = torch.tanh(z)                              # squash → (-1, 1)
-        # Log-prob under tanh-Normal (Jacobian correction for invertible transform)
-        lp   = (dist.log_prob(z) - torch.log(1.0 - a.pow(2) + 1e-6)).sum(-1)
+        z    = dist.sample()
+        a    = torch.tanh(z)
+        lp   = (dist.log_prob(z) - torch.log(1.0 - a.pow(2) + 1e-6)).sum(-1)  # (E*N,)
 
-        value = self.critic(state).squeeze()
+        a      = a.reshape(E, N, -1)       # (E, N, action_dim)
+        lp     = lp.reshape(E, N)          # (E, N)
+        new_hx = new_hx_f.reshape(E, N, -1)
 
-        return a.cpu().numpy(), lp.cpu(), value.cpu(), new_hx
+        # Centralised critic: one value per env
+        values = self.critic(state).squeeze(-1)   # (E,)
+
+        return a.cpu().numpy(), lp.cpu(), values.cpu(), new_hx
 
     # ------------------------------------------------------------------
     # Policy update
     # ------------------------------------------------------------------
 
     def update(self, buffer: RolloutBuffer) -> dict:
-        T, N = buffer.T, buffer.N
+        T, E, N = buffer.T, buffer.E, buffer.N
 
-        # Flatten (T, N, ...) → (T*N, ...) — each (t, i) pair is independent.
-        # This is the truncated-BPTT-length-1 approximation for recurrent PPO.
-        obs_f  = buffer.obs.reshape(T * N, -1)
-        act_f  = buffer.actions.reshape(T * N, -1)
-        olp_f  = buffer.log_probs.reshape(T * N)
-        hx_f   = buffer.hx.reshape(T * N, -1)
+        # Flatten (T, E, N, ...) → (T*E*N, ...) — each (t, e, i) triple is
+        # processed independently (truncated-BPTT-length-1 approximation).
+        obs_f  = buffer.obs.reshape(T * E * N, -1)
+        act_f  = buffer.actions.reshape(T * E * N, -1)
+        olp_f  = buffer.log_probs.reshape(T * E * N)
+        hx_f   = buffer.hx.reshape(T * E * N, -1)
 
-        # Shared advantage: one value per timestep, broadcast over agents
-        adv = buffer.advantages                              # (T,)
+        # Shared advantage: one value per (t, e), broadcast over N agents
+        adv = buffer.advantages                             # (T, E)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        adv_f = adv.unsqueeze(1).expand(T, N).reshape(T * N)
+        adv_f = adv.unsqueeze(-1).expand(T, E, N).reshape(T * E * N)
 
-        ret = buffer.returns                                 # (T,)
+        ret = buffer.returns                                # (T, E)
 
         a_losses, c_losses, ents = [], [], []
 
@@ -189,7 +210,6 @@ class MAPPO:
             mean, log_std, _ = self.actor(obs_f, hx_f)
             std  = log_std.exp().expand_as(mean)
             dist = Normal(mean, std)
-            # Recover pre-squash sample from stored bounded action
             z    = torch.atanh(act_f.clamp(-1 + 1e-6, 1 - 1e-6))
             nlp  = (dist.log_prob(z) - torch.log(1.0 - act_f.pow(2) + 1e-6)).sum(-1)
 
@@ -205,8 +225,9 @@ class MAPPO:
             self.actor_opt.step()
 
             # ---- Critic ----
-            vals   = self.critic(buffer.states).squeeze()   # (T,)
-            c_loss = 0.5 * ((vals - ret) ** 2).mean()
+            states_f = buffer.states.reshape(T * E, -1)              # (T*E, state_dim)
+            vals     = self.critic(states_f).squeeze(-1).reshape(T, E)  # (T, E)
+            c_loss   = 0.5 * ((vals - ret) ** 2).mean()
 
             self.critic_opt.zero_grad()
             c_loss.backward()
