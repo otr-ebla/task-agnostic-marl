@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environments & OS
+.venv/
+venv/
+.DS_Store
+
+# ML/DL outputs
+logs/
+checkpoints/
+wandb/
